@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
-#include <encoder.h>
+#include <Encoder.h>
 
 class EncoderDriver
 {
