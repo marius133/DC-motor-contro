@@ -152,8 +152,16 @@ int MotorDriver::commandToPwm_(float u) const
 {
     const float amplitude = fabsf(u);
     const uint32_t maxDuty = (1UL << cfg_.pwm_resolution_bits) - 1UL;
+    const float configuredMinimumDrive = (u > 0.0f) ? cfg_.minimumForwardDriveCommand : cfg_.minimumReverseDriveCommand;
+    const float minimumDriveCommand = constrain(configuredMinimumDrive, 0.0f, 1.0f);
 
-    int duty = static_cast<int>(lroundf(amplitude * static_cast<float>(maxDuty)));
+    float effectiveAmplitude = amplitude;
+    if (amplitude > 0.0f && minimumDriveCommand > amplitude)
+    {
+        effectiveAmplitude = minimumDriveCommand;
+    }
+
+    int duty = static_cast<int>(lroundf(effectiveAmplitude * static_cast<float>(maxDuty)));
     if (duty < 0)
     {
         duty = 0;

@@ -34,6 +34,7 @@ public:
     void setTargetNormalized(float normalized);
     void setTargetSpeedCountsPerSec(float targetSpeedCountsPerSec);
     void update(uint32_t dtUs);
+    void updateOpenLoop(uint32_t dtUs, float normalizedCommand);
     void stop();
 
     float targetSpeedCountsPerSec() const;

@@ -94,6 +94,26 @@ void MotorSpeedController::update(uint32_t dtUs)
     hasPreviousError_ = true;
 }
 
+void MotorSpeedController::updateOpenLoop(uint32_t dtUs, float normalizedCommand)
+{
+    encoderDriver_.update(dtUs);
+    measuredSpeedCountsPerSec_ = encoderDriver_.speed_counts_per_sec();
+
+    if (!enabled_ || dtUs == 0)
+    {
+        return;
+    }
+
+    targetSpeedCountsPerSec_ = 0.0f;
+    integral_ = 0.0f;
+    previousError_ = 0.0f;
+    hasPreviousError_ = false;
+
+    const float command = constrain(normalizedCommand, -1.0f, 1.0f);
+    motor_.setCommand(command);
+    lastCommand_ = command;
+}
+
 void MotorSpeedController::stop()
 {
     targetSpeedCountsPerSec_ = 0.0f;

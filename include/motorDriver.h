@@ -22,6 +22,8 @@ public:
         uint8_t pwm_resolution_bits = 12;
         bool invert = false;
         float deadzone = 0.0f;
+        float minimumForwardDriveCommand = 0.0f;
+        float minimumReverseDriveCommand = 0.0f;
     };
 
     MotorDriver(const DriverPins& pins, const DriverConfig& cfg);

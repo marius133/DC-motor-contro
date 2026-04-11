@@ -1,5 +1,8 @@
 #include <Arduino.h>
 
+#include <cctype>
+#include <cstring>
+
 #include "BME680Sensor.h"
 #include "CsvLogger.h"
 #include "GpsSensor.h"
@@ -28,6 +31,21 @@ struct AppConfig
         uint32_t autoIntervalMs = 5000;
     };
 
+    struct DriveTrimConfig
+    {
+        float leftTargetScale = 1.0f;
+        float rightTargetScale = 1.0f;
+    };
+
+    struct StraightDriveSyncConfig
+    {
+        bool enabled = true;
+        float steerDeadband = 0.08f;
+        float minThrottle = 0.0f;
+        float gain = 0.25f;
+        float maxCorrection = 0.20f;
+    };
+
     uint32_t usbBaudrate = 115200;
     uint32_t gpsBaudrate = 9600;
     uint32_t bmeReadIntervalMs = 1000;
@@ -36,6 +54,8 @@ struct AppConfig
     const char* logFilename = "env_log.csv";
     BME680Sensor::Config bme680;
     LoggingConfig logging;
+    DriveTrimConfig driveTrim;
+    StraightDriveSyncConfig straightSync;
     RCInput::Config rcInput;
     DriveMotorConfig leftMotor;
     DriveMotorConfig rightMotor;
@@ -51,11 +71,15 @@ MotorDriver::DriverPins makeMotorPins(uint8_t en1, uint8_t en2, uint8_t pwm1, ui
     return pins;
 }
 
-MotorDriver::DriverConfig makeMotorConfig(bool invert = false)
+MotorDriver::DriverConfig makeMotorConfig(bool invert = false,
+                                          float minimumForwardDriveCommand = 0.0f,
+                                          float minimumReverseDriveCommand = 0.0f)
 {
     MotorDriver::DriverConfig cfg;
     cfg.invert = invert;
     cfg.deadzone = 0.05f;
+    cfg.minimumForwardDriveCommand = minimumForwardDriveCommand;
+    cfg.minimumReverseDriveCommand = minimumReverseDriveCommand;
     return cfg;
 }
 
@@ -102,6 +126,21 @@ AppConfig makeAppConfig()
     cfg.logging.switchOnThreshold = 1500;
     cfg.logging.autoIntervalMs = 5000;
 
+    // Static trim. Keep both at 1.0 when straightSync is enabled unless one
+    // side needs a known mechanical offset.
+    cfg.driveTrim.leftTargetScale = 1.0f;
+    cfg.driveTrim.rightTargetScale = 1.0f;
+
+    // Closed-loop straight driving in both forward and reverse. When steering
+    // is centered, encoder speed difference keeps both wheels at the same speed.
+    cfg.straightSync.enabled = true;
+    cfg.straightSync.steerDeadband = 0.08f;
+    // RCInput applies its own deadzone, so 0.0 means sync applies for every
+    // actual forward/reverse command, including very low throttle.
+    cfg.straightSync.minThrottle = 0.0f;
+    cfg.straightSync.gain = 0.40f;
+    cfg.straightSync.maxCorrection = 0.30f;
+
     cfg.rcInput.channelMin = 172;
     cfg.rcInput.channelMid = 992;
     cfg.rcInput.channelMax = 1811;
@@ -113,14 +152,14 @@ AppConfig makeAppConfig()
     cfg.rcInput.deadzone = 0.05f;
 
     cfg.leftMotor.driverPins = makeMotorPins(23, 22, 2, 3);
-    cfg.leftMotor.driver = makeMotorConfig(false);
+    cfg.leftMotor.driver = makeMotorConfig(false, 0.0f, 0.0f);
     cfg.leftMotor.encoderPinA = 6;
     cfg.leftMotor.encoderPinB = 7;
     cfg.leftMotor.encoder = makeEncoderConfig(2048, false);
     cfg.leftMotor.speedControl = makeSpeedControlConfig();
 
     cfg.rightMotor.driverPins = makeMotorPins(21, 20, 4, 5);
-    cfg.rightMotor.driver = makeMotorConfig(false);
+    cfg.rightMotor.driver = makeMotorConfig(false, 0.0f, 0.0f);
     cfg.rightMotor.encoderPinA = 8;
     cfg.rightMotor.encoderPinB = 9;
     cfg.rightMotor.encoder = makeEncoderConfig(2048, false);
@@ -158,6 +197,28 @@ elapsedMillis statusTimer;
 elapsedMicros motorControlTimer;
 bool manualLogSwitchLatched = false;
 bool autoLoggingWasEnabled = false;
+
+enum class MotorTestSide
+{
+    None,
+    Left,
+    Right
+};
+
+struct MotorTestState
+{
+    MotorTestSide side = MotorTestSide::None;
+    float command = 0.0f;
+    bool active = false;
+    elapsedMillis timer;
+};
+
+constexpr uint32_t kMotorTestDurationMs = 1000;
+constexpr float kMotorTestCommand = 0.35f;
+constexpr float kNeutralDriveCommandDeadband = 0.001f;
+MotorTestState motorTest;
+char serialCommandBuffer[16] = {};
+size_t serialCommandLength = 0;
 
 void initializeSerial()
 {
@@ -221,6 +282,111 @@ void initializeLogging()
     Serial.println("SD card initialization failed");
 }
 
+void printMotorTestHelp()
+{
+    Serial.println("Motor test commands: lf/lr/rf/rr, stop, help");
+    Serial.println("Example: lr runs left motor reverse for 1 second at 35% command");
+}
+
+void stopMotorTest(const char* reason)
+{
+    motorTest.active = false;
+    motorTest.side = MotorTestSide::None;
+    motorTest.command = 0.0f;
+    leftMotor.enable(false);
+    rightMotor.enable(false);
+
+    Serial.print("Motor test stopped");
+    if (reason != nullptr)
+    {
+        Serial.print(": ");
+        Serial.print(reason);
+    }
+    Serial.println();
+}
+
+void startMotorTest(MotorTestSide side, float command, const char* label)
+{
+    motorTest.side = side;
+    motorTest.command = command;
+    motorTest.active = true;
+    motorTest.timer = 0;
+
+    leftMotor.enable(side == MotorTestSide::Left);
+    rightMotor.enable(side == MotorTestSide::Right);
+
+    Serial.print("Motor test ");
+    Serial.print(label);
+    Serial.println(" started");
+}
+
+void handleSerialCommand(char* command)
+{
+    for (size_t i = 0; command[i] != '\0'; ++i)
+    {
+        command[i] = static_cast<char>(tolower(command[i]));
+    }
+
+    if (strcmp(command, "lf") == 0)
+    {
+        startMotorTest(MotorTestSide::Left, kMotorTestCommand, "left forward");
+    }
+    else if (strcmp(command, "lr") == 0)
+    {
+        startMotorTest(MotorTestSide::Left, -kMotorTestCommand, "left reverse");
+    }
+    else if (strcmp(command, "rf") == 0)
+    {
+        startMotorTest(MotorTestSide::Right, kMotorTestCommand, "right forward");
+    }
+    else if (strcmp(command, "rr") == 0)
+    {
+        startMotorTest(MotorTestSide::Right, -kMotorTestCommand, "right reverse");
+    }
+    else if (strcmp(command, "stop") == 0)
+    {
+        stopMotorTest("serial command");
+    }
+    else if (strcmp(command, "help") == 0)
+    {
+        printMotorTestHelp();
+    }
+    else
+    {
+        Serial.print("Unknown command: ");
+        Serial.println(command);
+        printMotorTestHelp();
+    }
+}
+
+void processSerialInput()
+{
+    while (Serial.available() > 0)
+    {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r')
+        {
+            continue;
+        }
+
+        if (c == '\n')
+        {
+            serialCommandBuffer[serialCommandLength] = '\0';
+            if (serialCommandLength > 0)
+            {
+                handleSerialCommand(serialCommandBuffer);
+            }
+            serialCommandLength = 0;
+            return;
+        }
+
+        if (isprint(static_cast<unsigned char>(c)) && serialCommandLength < (sizeof(serialCommandBuffer) - 1))
+        {
+            serialCommandBuffer[serialCommandLength++] = c;
+        }
+    }
+}
+
 void updateEnvironment()
 {
     if (!bme680Sensor.isInitialized() || bmeTimer < kConfig.bmeReadIntervalMs)
@@ -235,12 +401,68 @@ void updateEnvironment()
     }
 }
 
+bool updateMotorTest(uint32_t dtUs)
+{
+    if (!motorTest.active)
+    {
+        return false;
+    }
+
+    if (motorTest.timer >= kMotorTestDurationMs)
+    {
+        stopMotorTest("complete");
+        leftMotor.update(dtUs);
+        rightMotor.update(dtUs);
+        return true;
+    }
+
+    if (motorTest.side == MotorTestSide::Left)
+    {
+        if (!leftMotor.isEnabled())
+        {
+            leftMotor.enable(true);
+        }
+        if (rightMotor.isEnabled())
+        {
+            rightMotor.enable(false);
+        }
+
+        leftMotor.updateOpenLoop(dtUs, motorTest.command);
+        rightMotor.update(dtUs);
+        return true;
+    }
+
+    if (motorTest.side == MotorTestSide::Right)
+    {
+        if (!rightMotor.isEnabled())
+        {
+            rightMotor.enable(true);
+        }
+        if (leftMotor.isEnabled())
+        {
+            leftMotor.enable(false);
+        }
+
+        leftMotor.update(dtUs);
+        rightMotor.updateOpenLoop(dtUs, motorTest.command);
+        return true;
+    }
+
+    stopMotorTest("invalid side");
+    return true;
+}
+
 void updateMotors(const RCCommand& rc)
 {
     const uint32_t dtUs = motorControlTimer;
     motorControlTimer = 0;
 
     if (dtUs == 0)
+    {
+        return;
+    }
+
+    if (updateMotorTest(dtUs))
     {
         return;
     }
@@ -258,8 +480,71 @@ void updateMotors(const RCCommand& rc)
         return;
     }
 
-    const float leftTarget = constrain(rc.throttle - rc.steer, -1.0f, 1.0f);
-    const float rightTarget = constrain(rc.throttle + rc.steer, -1.0f, 1.0f);
+    if (fabsf(rc.throttle) <= kNeutralDriveCommandDeadband &&
+        fabsf(rc.steer) <= kNeutralDriveCommandDeadband)
+    {
+        if (leftMotor.isEnabled() || rightMotor.isEnabled())
+        {
+            leftMotor.enable(false);
+            rightMotor.enable(false);
+        }
+
+        leftMotor.update(dtUs);
+        rightMotor.update(dtUs);
+        return;
+    }
+
+    float leftTarget = 0.0f;
+    float rightTarget = 0.0f;
+    if (fabsf(rc.throttle) > kNeutralDriveCommandDeadband)
+    {
+        const float turnAmount = constrain(fabsf(rc.steer), 0.0f, 1.0f);
+        const float innerWheelScale = 1.0f - turnAmount;
+
+        // While driving forward/reverse, steering slows the inside wheel
+        // instead of immediately commanding it to stop or reverse.
+        if (rc.steer >= 0.0f)
+        {
+            leftTarget = rc.throttle;
+            rightTarget = rc.throttle * innerWheelScale;
+        }
+        else
+        {
+            leftTarget = rc.throttle * innerWheelScale;
+            rightTarget = rc.throttle;
+        }
+    }
+    else
+    {
+        // With no forward/reverse command, keep pivot turning available.
+        leftTarget = rc.steer;
+        rightTarget = -rc.steer;
+    }
+
+    leftTarget *= kConfig.driveTrim.leftTargetScale;
+    rightTarget *= kConfig.driveTrim.rightTargetScale;
+
+    if (kConfig.straightSync.enabled &&
+        fabsf(rc.steer) < kConfig.straightSync.steerDeadband &&
+        fabsf(rc.throttle) > kConfig.straightSync.minThrottle)
+    {
+        // Compare wheel speeds in the commanded travel direction, so the same
+        // sync correction works when driving forward and reverse.
+        const float direction = (rc.throttle >= 0.0f) ? 1.0f : -1.0f;
+        const float leftSpeedAlongCommand = leftMotor.measuredSpeedCountsPerSec() * direction;
+        const float rightSpeedAlongCommand = rightMotor.measuredSpeedCountsPerSec() * direction;
+        const float speedError = rightSpeedAlongCommand - leftSpeedAlongCommand;
+        const float maxSpeed = fabsf(kConfig.leftMotor.speedControl.maxTargetSpeedCountsPerSec);
+        const float correction = constrain((speedError / maxSpeed) * kConfig.straightSync.gain,
+                                           -kConfig.straightSync.maxCorrection,
+                                           kConfig.straightSync.maxCorrection);
+
+        leftTarget += correction * direction;
+        rightTarget -= correction * direction;
+    }
+
+    leftTarget = constrain(leftTarget, -1.0f, 1.0f);
+    rightTarget = constrain(rightTarget, -1.0f, 1.0f);
 
     if (!leftMotor.isEnabled())
     {
@@ -400,6 +685,10 @@ void printStatus(const RCCommand& rc)
     Serial.print(rightMotor.measuredSpeedCountsPerSec(), 0);
     Serial.print("/");
     Serial.print(rightMotor.targetSpeedCountsPerSec(), 0);
+    Serial.print(" cmd=");
+    Serial.print(leftMotor.lastCommand(), 2);
+    Serial.print("/");
+    Serial.print(rightMotor.lastCommand(), 2);
     Serial.print(" | log_mode=");
     if (isLoggingChannelOn(rc, kConfig.logging.autoIntervalChannel))
     {
@@ -454,6 +743,7 @@ void setup()
 
 void loop()
 {
+    processSerialInput();
     rcInput.update();
     gpsSensor.update();
     updateEnvironment();
