@@ -159,7 +159,10 @@ AppConfig makeAppConfig()
     cfg.leftMotor.speedControl = makeSpeedControlConfig();
 
     cfg.rightMotor.driverPins = makeMotorPins(21, 20, 4, 5);
-    cfg.rightMotor.driver = makeMotorConfig(false, 0.0f, 0.0f);
+    // Right motor wiring was reversed relative to the commanded direction, so
+    // invert the driver command to keep forward/reverse and pivot steering
+    // aligned with the RC inputs.
+    cfg.rightMotor.driver = makeMotorConfig(true, 0.0f, 0.0f);
     cfg.rightMotor.encoderPinA = 8;
     cfg.rightMotor.encoderPinB = 9;
     cfg.rightMotor.encoder = makeEncoderConfig(2048, false);
